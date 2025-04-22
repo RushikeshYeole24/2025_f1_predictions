@@ -1,0 +1,278 @@
+import fastf1
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error
+
+# Load all relevant 2025 GP sessions
+sessions_2025 = {
+    'bahrain': fastf1.get_session(2025, 'Bahrain', 'R'),
+    'saudi': fastf1.get_session(2025, 'Saudi Arabia', 'R'),  # Previous year for reference
+    'australia': fastf1.get_session(2025, 'Australia', 'R'),
+    'japan': fastf1.get_session(2025, 'Japan', 'R'),
+    'china': fastf1.get_session(2025, 'China', 'R')
+}
+
+# Load all sessions
+for session in sessions_2025.values():
+    session.load()
+
+# Map full names to FastF1 3-letter codes
+driver_mapping = {
+    "Oscar Piastri": "PIA", "George Russell": "RUS", "Lando Norris": "NOR", "Max Verstappen": "VER",
+    "Lewis Hamilton": "HAM", "Charles Leclerc": "LEC", "Isack Hadjar": "HAD", "Andrea Kimi Antonelli": "ANT",
+    "Yuki Tsunoda": "TSU", "Alexander Albon": "ALB", "Esteban Ocon": "OCO", "Nico Hülkenberg": "HUL",
+    "Fernando Alonso": "ALO", "Lance Stroll": "STR", "Carlos Sainz Jr.": "SAI", "Sergio Perez": "PER",
+    "Oliver Bearman": "BEA", "Jack Doohan": "DOO", "Gabriel Bortoleto": "BOR", "Liam Lawson": "LAW"
+}
+
+# Reverse mapping for lookup by code
+code_to_driver = {v: k for k, v in driver_mapping.items()}
+
+# First check the actual available columns in the results DataFrame
+print("\nChecking available columns in results DataFrame:")
+sample_session = next(iter(sessions_2025.values()))
+print(list(sample_session.results.columns))
+
+# Collect race results and points from all 2025 races
+race_results_2025 = {}
+for race, session in sessions_2025.items():
+    if race != 'saudi':  # Exclude Saudi 2024 data from current standings
+        # Use the columns that actually exist in the DataFrame
+        results = session.results[["DriverNumber", "Points", "Position"]].copy()
+        
+        # Get Driver abbreviation/code from DriverNumber
+        results['Driver'] = results['DriverNumber'].map(
+            lambda num: session.get_driver(num)['Abbreviation'] if num in session.drivers else 'UNK'
+        )
+        
+        # Safely get team names using session.get_driver()
+        results['Team'] = results['DriverNumber'].map(
+            lambda num: session.get_driver(num).get('TeamName', 'Unknown') if num in session.drivers else 'Unknown'
+        )
+
+        race_results_2025[race] = results
+
+# Calculate current 2025 championship standings
+driver_standings = {}
+team_standings = {}
+
+for results in race_results_2025.values():
+    for _, row in results.iterrows():
+        driver_code = row['Driver']
+        driver_name = code_to_driver.get(driver_code, driver_code)
+        points = row['Points']
+        team = row['Team']
+
+        # Store points by both code and full name for flexible lookup
+        driver_standings[driver_code] = driver_standings.get(driver_code, 0) + points
+        driver_standings[driver_name] = driver_standings.get(driver_name, 0) + points
+        team_standings[team] = team_standings.get(team, 0) + points
+
+# Print driver standings for debugging
+print("\nCurrent Driver Standings:")
+print(driver_standings)
+
+# Extract lap and sector times from recent races
+recent_laps = pd.DataFrame()
+for race, session in sessions_2025.items():
+    if race != 'saudi':  # We want to predict Saudi
+        try:
+            # First check available columns
+            print(f"\nAvailable columns in {race} laps DataFrame:")
+            print(list(session.laps.columns))
+            
+            required_cols = ["Driver", "Team", "LapTime", "Sector1Time", "Sector2Time", "Sector3Time"]
+            available_cols = [col for col in required_cols if col in session.laps.columns]
+            
+            if available_cols:
+                laps = session.laps[available_cols].copy()
+                laps['Race'] = race
+                recent_laps = pd.concat([recent_laps, laps])
+        except Exception as e:
+            print(f"Error processing {race} laps: {e}")
+
+if len(recent_laps) > 0:
+    # Drop NA values but keep track of which columns had data
+    print(f"\nLap data before dropping NAs: {len(recent_laps)} rows")
+    col_counts_before = recent_laps.count()
+    recent_laps.dropna(subset=['LapTime'], inplace=True)
+    print(f"Lap data after dropping NAs: {len(recent_laps)} rows")
+    
+    # Convert times to seconds for columns that exist
+    for col in ["LapTime", "Sector1Time", "Sector2Time", "Sector3Time"]:
+        if col in recent_laps.columns:
+            try:
+                recent_laps[f"{col} (s)"] = recent_laps[col].dt.total_seconds()
+            except:
+                print(f"Could not convert {col} to seconds")
+
+    # Calculate average sector times from recent races
+    lap_time_cols = [col for col in recent_laps.columns if col.endswith("(s)")]
+    if lap_time_cols and 'Driver' in recent_laps.columns:
+        sector_times_2025 = recent_laps.groupby(["Driver"])[lap_time_cols].mean().reset_index()
+        if 'Team' in recent_laps.columns:
+            team_info = recent_laps[['Driver', 'Team']].drop_duplicates().set_index('Driver')
+            sector_times_2025 = sector_times_2025.merge(team_info, on='Driver', how='left')
+    else:
+        # Create empty DataFrame with expected columns
+        sector_times_2025 = pd.DataFrame(columns=['Driver', 'Team', 'LapTime (s)', 
+                                                'Sector1Time (s)', 'Sector2Time (s)', 'Sector3Time (s)'])
+else:
+    # Create empty DataFrame with expected columns
+    sector_times_2025 = pd.DataFrame(columns=['Driver', 'Team', 'LapTime (s)', 
+                                            'Sector1Time (s)', 'Sector2Time (s)', 'Sector3Time (s)'])
+
+# Print available drivers in sector times for debugging
+print("\nAvailable drivers in sector times:")
+print(sector_times_2025["Driver"].unique() if len(sector_times_2025) > 0 else "No driver data available")
+
+# 2025 Qualifying Data with Teams
+qualifying_2025 = pd.DataFrame({
+    "Driver": ["Max Verstappen", "Charles Leclerc", "Sergio Perez", "Carlos Sainz Jr.", "George Russell",
+               "Lando Norris", "Lewis Hamilton", "Oscar Piastri", "Fernando Alonso", "Isack Hadjar",
+               "Andrea Kimi Antonelli", "Yuki Tsunoda", "Alexander Albon", "Esteban Ocon", "Nico Hülkenberg",
+               "Lance Stroll", "Oliver Bearman", "Jack Doohan", "Gabriel Bortoleto", "Liam Lawson"],
+    "Team": ["Red Bull Racing", "Ferrari", "Red Bull Racing", "Ferrari", "Mercedes",
+             "McLaren", "Mercedes", "McLaren", "Aston Martin", "RB",
+             "Mercedes", "RB", "Williams", "Alpine", "Haas",
+             "Aston Martin", "Haas", "Alpine", "Visa Cash App RB", "RB"],
+    "QualifyingTime (s)": [77.526, 77.631, 77.658, 77.766, 77.832,
+                           77.987, 78.044, 78.089, 78.132, 78.243,
+                           78.276, 78.398, 78.432, 78.521, 78.567,
+                           78.612, 78.698, 78.734, 78.789, 78.823]
+})
+
+# Map drivers to their codes
+qualifying_2025["DriverCode"] = qualifying_2025["Driver"].map(driver_mapping)
+
+# Update qualifying_2025 DataFrame with current championship points
+qualifying_2025["ChampPoints"] = qualifying_2025["Driver"].map(
+    lambda driver: driver_standings.get(driver, 0)
+)
+
+qualifying_2025["TeamTotalPoints"] = qualifying_2025["Team"].map(team_standings).fillna(0)
+
+# Check if we have any sector time data
+if len(sector_times_2025) > 0:
+    # Create a mapping dictionary to standardize driver codes in sector times
+    driver_code_mapping = {}
+    for driver in sector_times_2025["Driver"].unique():
+        # Try to find a matching driver in our mapping
+        if driver in driver_mapping.values():  # If it's already a code
+            driver_code_mapping[driver] = driver
+        else:  # If it's potentially a full name
+            driver_code_mapping[driver] = driver_mapping.get(driver, driver)
+    
+    # Add driver codes to sector times
+    sector_times_2025["DriverCode"] = sector_times_2025["Driver"].map(driver_code_mapping)
+    
+    # Merge qualifying data with sector times using driver code
+    print("\nMerging data using driver codes...")
+    if 'Team' in sector_times_2025.columns:
+        merged_data = qualifying_2025.merge(
+            sector_times_2025,
+            left_on="DriverCode",
+            right_on="DriverCode",
+            how="left",
+            suffixes=('', '_sector')
+        )
+    else:
+        merged_data = qualifying_2025.merge(
+            sector_times_2025,
+            left_on="DriverCode",
+            right_on="DriverCode",
+            how="left",
+            suffixes=('', '_sector')
+        )
+else:
+    # No sector time data available, just use qualifying data
+    print("\nNo sector time data available, using qualifying data only.")
+    merged_data = qualifying_2025.copy()
+
+# Print debugging info
+print(f"\nTotal rows in qualifying data: {len(qualifying_2025)}")
+print(f"Total rows in sector times data: {len(sector_times_2025)}")
+print(f"Total rows in merged data: {len(merged_data)}")
+print(f"Number of drivers with valid lap times: {merged_data['LapTime (s)'].notna().sum() if 'LapTime (s)' in merged_data.columns else 0}")
+
+# If no valid lap times, we need to adjust our approach
+if 'LapTime (s)' not in merged_data.columns or merged_data['LapTime (s)'].notna().sum() == 0:
+    print("\nWARNING: No valid lap time data available for training.")
+    print("Using qualifying times to estimate race pace instead...")
+    
+    # Estimate race lap times based on qualifying times (add 2-5% to account for fuel, tires etc.)
+    merged_data["LapTime (s)"] = merged_data["QualifyingTime (s)"] * np.random.uniform(1.02, 1.05, size=len(merged_data))
+
+# Define feature set - use only columns we're confident have data
+X = merged_data[["QualifyingTime (s)", "ChampPoints", "TeamTotalPoints"]].copy()
+
+# Add sector times if available
+sector_cols_available = []
+for col in ["Sector1Time (s)", "Sector2Time (s)", "Sector3Time (s)"]:
+    if col in merged_data.columns and merged_data[col].notna().sum() > 0:
+        X[col] = merged_data[col].fillna(merged_data["QualifyingTime (s)"]/3)
+        sector_cols_available.append(col)
+
+# If no sector times available, estimate them from qualifying time
+if not sector_cols_available:
+    X["Sector1Time (s)"] = X["QualifyingTime (s)"] * 0.33
+    X["Sector2Time (s)"] = X["QualifyingTime (s)"] * 0.33
+    X["Sector3Time (s)"] = X["QualifyingTime (s)"] * 0.34
+
+# Target: Average race lap time per driver
+y = merged_data["LapTime (s)"]
+
+# Drop rows where target (LapTime) is NaN
+valid_indices = merged_data["LapTime (s)"].notna()
+X = X[valid_indices]
+y = y[valid_indices]
+
+print(f"\nValid samples for training: {len(X)}")
+
+# Train Gradient Boosting Model, but only if we have enough samples
+if len(X) >= 5:  # Minimum threshold for meaningful training (reduced from 10)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=38)
+    
+    # Make sure test size is at least 1
+    if len(y_test) > 0:
+        model = GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, random_state=38)
+        model.fit(X_train, y_train)
+        
+        # Evaluate Model
+        y_pred = model.predict(X_test)
+        mae = mean_absolute_error(y_test, y_pred)
+        print(f"\n🔍 Model Error (MAE): {mae:.2f} seconds")
+        
+        # Predict race times using model for all drivers
+        X_all = merged_data[X.columns].fillna(X.mean())
+        predicted_race_times = model.predict(X_all)
+    else:
+        print("\nNot enough test samples after splitting. Using simple estimation instead.")
+        predicted_race_times = merged_data["QualifyingTime (s)"].values * np.random.uniform(1.02, 1.04, size=len(merged_data))
+else:
+    print("\nNot enough valid samples for model training. Using simple estimation instead.")
+    # Create a simple estimate based on qualifying times (add 2-4% for race conditions)
+    predicted_race_times = merged_data["QualifyingTime (s)"].values * np.random.uniform(1.02, 1.04, size=len(merged_data))
+    
+merged_data["PredictedRaceTime (s)"] = predicted_race_times
+
+# Rank drivers by predicted race time
+merged_data = merged_data.sort_values(by="PredictedRaceTime (s)").reset_index(drop=True)
+merged_data["Position"] = merged_data.index + 1
+
+# Format for prettier output
+merged_data["PredictedRaceTime (s)"] = merged_data["PredictedRaceTime (s)"].round(3)
+
+# Print final predictions
+print("\n🏁 Predicted 2025 Saudi Arabian GP Results 🏁\n")
+print("Rankings:")
+final_results = merged_data[["Position", "Driver", "Team", "ChampPoints", "PredictedRaceTime (s)"]]
+print(final_results.to_string(index=False))
+
+# Additional insights
+print("\n📊 2025 Championship Impact:")
+for team in merged_data["Team"].unique():
+    team_points = team_standings.get(team, 0)
+    print(f"{team}: {team_points} points")
